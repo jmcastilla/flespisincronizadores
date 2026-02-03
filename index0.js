@@ -185,6 +185,12 @@ async function main() {
   const tableColsSet = await loadTableColumns(db);
   console.log("✅ Columnas cargadas de mainData:", tableColsSet.size);
 
+  const http = require("http");
+http.createServer((req, res) => {
+  res.writeHead(200, {"Content-Type": "text/plain"});
+  res.end("OK");
+}).listen(process.env.PORT || 3000);
+
   const client = mqtt.connect(MQTT_URL, {
     username: FLESPI_TOKEN,
     password: "",
