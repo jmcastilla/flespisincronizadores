@@ -2,14 +2,15 @@
   "name": "proyectoflespi",
   "version": "1.0.0",
   "description": "",
-  "main": "index0.js",
+  "main": "app.js",
   "scripts": {
-    "start": "node index0.js"
+    "start": "node app.js"
   },
   "keywords": [],
   "author": "",
   "license": "ISC",
   "dependencies": {
+    "@azure/event-hubs": "^6.0.3",
     "dotenv": "^17.2.3",
     "mqtt": "^5.14.1",
     "mysql2": "^3.16.2",
