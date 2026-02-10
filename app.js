@@ -1,8 +1,9 @@
 /**
  * Node.js: Flespi MQTT -> Azure Event Hubs
  * - Lee mensajes MQTT de flespi
- * - Normaliza/convierte campos (igual que tu lógica)
+ * - Normaliza/convierte campos
  * - Publica cada registro a Azure Event Hubs (en batch)
+ * - Logs explícitos para confirmar llegada y envío
  *
  * Reqs:
  *   npm i mqtt dotenv @azure/event-hubs
@@ -64,16 +65,7 @@ function normalizeToArray(parsed) {
   return [];
 }
 
-function nowUtcMySQLDateTime() {
-  const d = new Date();
-  const pad = (x) => String(x).padStart(2, "0");
-  return (
-    `${d.getUTCFullYear()}-${pad(d.getUTCMonth() + 1)}-${pad(d.getUTCDate())} ` +
-    `${pad(d.getUTCHours())}:${pad(d.getUTCMinutes())}:${pad(d.getUTCSeconds())}`
-  );
-}
-
-// Te recomiendo mandar ISO UTC (mejor para SQL Server) + opcional string tipo MySQL si lo necesitas
+// Recomendado para SQL Server: ISO UTC
 function unixSecondsToIsoUtc(ts) {
   const n = Number(ts);
   if (!Number.isFinite(n)) return undefined;
@@ -81,26 +73,13 @@ function unixSecondsToIsoUtc(ts) {
   return new Date(ms).toISOString();
 }
 
-// (Opcional) si quieres mantener el formato "YYYY-MM-DD HH:mm:ss"
-function unixSecondsToMySQLDateTime(ts) {
-  const n = Number(ts);
-  if (!Number.isFinite(n)) return undefined;
-  const ms = n > 1e12 ? n : n * 1000;
-  const d = new Date(ms);
-  const pad = (x) => String(x).padStart(2, "0");
-  return (
-    `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())} ` +
-    `${pad(d.getHours())}:${pad(d.getMinutes())}:${pad(d.getSeconds())}`
-  );
-}
-
 /**
- * Mapa JSON key -> columna (lo que tú quieres guardar)
+ * Mapa JSON key -> nombre de campo (lo que mandarás al Event Hub)
  */
 const KEY_TO_COL = {
   ident: "deviceID",
   "protocol.version": "protocolVersion",
-  timestamp: "dateTime", // lo convertimos a ISO UTC (recomendado)
+  timestamp: "dateTime",
   "position.latitude": "latitude",
   "position.longitude": "longitude",
   "engine.ignition.status": "ignition_status",
@@ -123,8 +102,7 @@ const CONVERTERS = {
   "position.latitude": num,
   "position.longitude": num,
   "position.speed": num,
-  timestamp: unixSecondsToIsoUtc, // <-- recomendado (ISO UTC)
-  // timestamp: unixSecondsToMySQLDateTime, // <-- si prefieres string "YYYY-MM-DD HH:mm:ss"
+  timestamp: unixSecondsToIsoUtc,
   "vehicle.mileage": num,
   "gsm.mcc": num,
   "gsm.cellid": num,
@@ -145,33 +123,28 @@ function buildRowFromPayload(p) {
     row[col] = value;
   }
 
-  // Defaults / campos fijos como en tu código
+  // Defaults / campos fijos
   row.OperadorGps = "QL-GV300";
   row.imei = row.deviceID;
   row.bat = 100;
   row.battery = 100;
   row.lock_status = 1;
-  row.insertDateTime = new Date().toISOString(); // mejor que string local/UTC ambiguo
-
-  // Si NO quieres forzar mileage a 0, quita esto:
+  row.insertDateTime = new Date().toISOString();
   row.mileage = row.mileage ?? 0;
 
   return row;
 }
 
-// Genera un ID estable para deduplicación en SQL (opcional pero recomendado)
-function makeEventId(row, originalPayload) {
-  // Ideal: deviceID + timestamp (segundos) o dateTime
-  // Si tu payload trae timestamp original, úsalo.
+// ID estable para dedupe (opcional)
+function makeEventId(row) {
   const device = row.deviceID || "noDevice";
   const dt = row.dateTime || "";
-  // Puedes sumar lat/lon si quieres hacerlo aún más único.
   return `${device}_${dt}`;
 }
 
 // ===== Main =====
 async function main() {
-  // Healthcheck HTTP (por ejemplo para Render/Heroku/Azure App Service)
+  // Healthcheck HTTP (Render/Heroku/Azure App Service)
   http
     .createServer((_req, res) => {
       res.writeHead(200, { "Content-Type": "text/plain" });
@@ -206,6 +179,11 @@ async function main() {
   client.on("message", async (_topic, payloadBuf) => {
     const rawStr = payloadBuf.toString("utf8");
 
+    // ✅ Log de llegada
+    console.log(
+      `📩 MQTT recibido | topic=${_topic} | bytes=${payloadBuf.length} | ${new Date().toISOString()}`
+    );
+
     let parsed;
     try {
       parsed = JSON.parse(rawStr);
@@ -215,47 +193,74 @@ async function main() {
     }
 
     const items = normalizeToArray(parsed);
-    if (!items.length) return;
+    if (!items.length) {
+      console.log("⚠️ MQTT: JSON válido pero vacío (sin items)");
+      return;
+    }
+
+    console.log(`📦 Items en mensaje: ${items.length}`);
 
     // Batch para performance
     let batch = await producer.createBatch();
+    let added = 0;
+    let skipped = 0;
+    let sent = 0;
+    let loggedSample = false;
 
     for (const p of items) {
       try {
         const row = buildRowFromPayload(p);
 
-        // Exigir ident (deviceID) para evitar basura
-        if (!row.deviceID) continue;
+        if (!row.deviceID) {
+          skipped++;
+          continue;
+        }
 
-        const eventId = makeEventId(row, p);
+        const eventId = makeEventId(row);
 
         const eventBody = {
           ...row,
-          eventId, // <-- útil para dedupe en SQL
+          eventId,
           _topic,
           _receivedAtUtc: new Date().toISOString(),
         };
 
-        // Si se llena, envía y crea otro batch
+        // 🧾 Log de ejemplo (solo 1 por mensaje)
+        if (!loggedSample) {
+          console.log("🧾 Ejemplo evento:", eventBody);
+          loggedSample = true;
+        }
+
         const ok = batch.tryAdd({ body: eventBody });
         if (!ok) {
           await producer.sendBatch(batch);
-          batch = await producer.createBatch();
+          sent += batch.count;
 
+          batch = await producer.createBatch();
           const ok2 = batch.tryAdd({ body: eventBody });
           if (!ok2) {
-            console.error("❌ Evento demasiado grande para Event Hubs (no se pudo agregar al batch)");
+            console.error("❌ Evento demasiado grande para Event Hubs");
+            skipped++;
+            continue;
           }
         }
+
+        added++;
       } catch (e) {
         console.error("❌ Error procesando payload:", e);
+        skipped++;
       }
     }
 
     if (batch.count > 0) {
       await producer.sendBatch(batch);
-      // console.log(`✅ Enviados ${batch.count} eventos a Event Hubs`);
+      sent += batch.count;
     }
+
+    // ✅ Log final
+    console.log(
+      `✅ Publicado a Event Hub | added=${added} | sent=${sent} | skipped=${skipped} | ${new Date().toISOString()}`
+    );
   });
 
   client.on("error", (err) => console.error("MQTT error:", err));
