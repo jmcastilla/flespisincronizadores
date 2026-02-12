@@ -39,7 +39,9 @@ const INTERVAL_MS = 60_000;        // 1 minuto
 const SELECT_SQL = `
 SELECT
   maindataID, deviceID, OperadorGps, imei, dateTime, insertDateTime,
-  bat, battery, latitude, longitude, speed, lock_status, ignition_status
+  bat, battery, latitude, longitude, speed,
+  CAST(lock_status AS UNSIGNED) AS lock_status,
+  CAST(ignition_status AS UNSIGNED) AS ignition_status
 FROM PlacasGps.mainData
 WHERE actualizado3 = 0
 ORDER BY maindataID ASC
