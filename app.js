@@ -33,7 +33,7 @@ if (!EVENTHUB_NAME) throw new Error("Falta EVENTHUB_NAME");
 // ===== Ajustes =====
 const BATCH_DB_LIMIT = 1000;      // equivale a "top 1000"
 const UPDATE_CHUNK = 500;         // ids por UPDATE (para no pasar límites de placeholders)
-const INTERVAL_MS = 60_000;        // 1 minuto
+const INTERVAL_MS = 20_000;        // 1 minuto
 
 // En MySQL, conviene ordenar para procesar establemente
 const SELECT_SQL = `
