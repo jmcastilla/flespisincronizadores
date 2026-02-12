@@ -1,276 +1,202 @@
 /**
- * Node.js: Flespi MQTT -> Azure Event Hubs
- * - Lee mensajes MQTT de flespi
- * - Normaliza/convierte campos
- * - Publica cada registro a Azure Event Hubs (en batch)
- * - Logs explícitos para confirmar llegada y envío
+ * MySQL -> Azure Event Hubs
+ * - cada 1 minuto: lee hasta 1000 filas donde actualizado3=0
+ * - envía a Event Hub en batch
+ * - si envío OK: marca actualizado3=1 por maindataID
  *
- * Reqs:
- *   npm i mqtt dotenv @azure/event-hubs
- *
- * .env:
- *   FLESPI_TOKEN=...
- *   CHANNEL_ID=...
- *   EVENTHUB_CONNECTION_STRING=Endpoint=sb://...;SharedAccessKeyName=...;SharedAccessKey=...;EntityPath=...
- *   EVENTHUB_NAME=gps-telemetry
- *   PORT=3000
+ * npm i dotenv mysql2 @azure/event-hubs
  */
 
 require("dotenv").config();
 
-const mqtt = require("mqtt");
 const http = require("http");
+const mysql = require("mysql2/promise");
 const { EventHubProducerClient } = require("@azure/event-hubs");
 
-// ===== ENV =====
-const FLESPI_TOKEN = process.env.FLESPI_TOKEN;
-const CHANNEL_ID = process.env.CHANNEL_ID;
+const {
+  MYSQL_HOST,
+  MYSQL_PORT = 3306,
+  MYSQL_USER,
+  MYSQL_PASSWORD,
+  MYSQL_DATABASE = "PlacasGps",
+  EVENTHUB_CONNECTION_STRING,
+  EVENTHUB_NAME,
+  PORT = 3000,
+} = process.env;
 
-const EVENTHUB_CONNECTION_STRING = process.env.EVENTHUB_CONNECTION_STRING;
-const EVENTHUB_NAME = process.env.EVENTHUB_NAME;
-
-if (!FLESPI_TOKEN) throw new Error("Falta FLESPI_TOKEN");
-if (!CHANNEL_ID) throw new Error("Falta CHANNEL_ID");
+if (!MYSQL_HOST) throw new Error("Falta MYSQL_HOST");
+if (!MYSQL_USER) throw new Error("Falta MYSQL_USER");
+if (!MYSQL_DATABASE) throw new Error("Falta MYSQL_DATABASE");
 if (!EVENTHUB_CONNECTION_STRING) throw new Error("Falta EVENTHUB_CONNECTION_STRING");
 if (!EVENTHUB_NAME) throw new Error("Falta EVENTHUB_NAME");
 
-// ===== MQTT =====
-const MQTT_URL = "mqtts://mqtt.flespi.io:8883";
-const TOPIC = `flespi/message/gw/channels/${CHANNEL_ID}/+`;
+// ===== Ajustes =====
+const BATCH_DB_LIMIT = 1000;      // equivale a "top 1000"
+const UPDATE_CHUNK = 500;         // ids por UPDATE (para no pasar límites de placeholders)
+const INTERVAL_MS = 60_000;        // 1 minuto
 
-// ===== Helpers =====
-function b2i(v) {
-  if (v === true) return 1;
-  if (v === false) return 0;
-  if (v === null || v === undefined) return undefined;
-  const n = Number(v);
-  return Number.isFinite(n) ? n : undefined;
+// En MySQL, conviene ordenar para procesar establemente
+const SELECT_SQL = `
+SELECT
+  maindataID, deviceID, OperadorGps, imei, dateTime, insertDateTime,
+  bat, battery, latitude, longitude, speed, lock_status, ignition_status
+FROM PlacasGps.mainData
+WHERE actualizado3 = 0
+ORDER BY maindataID ASC
+LIMIT ?
+`;
+
+function toIsoIfDate(v) {
+  return v instanceof Date ? v.toISOString() : v;
 }
 
-function num(v) {
-  if (v === null || v === undefined) return undefined;
-  const n = Number(v);
-  return Number.isFinite(n) ? n : undefined;
+// Puedes agregar/ajustar normalización aquí
+function transformRow(r) {
+  const out = { ...r };
+  out.dateTime = toIsoIfDate(out.dateTime);
+  out.insertDateTime = toIsoIfDate(out.insertDateTime);
+
+  // eventId útil para dedupe (opcional)
+  const device = out.deviceID || out.imei || "noDevice";
+  out.eventId = `${device}_${out.dateTime || ""}_${out.maindataID}`;
+
+  out._sentAtUtc = new Date().toISOString();
+  return out;
 }
 
-function str(v) {
-  if (v === null || v === undefined) return undefined;
-  const s = String(v);
-  return s.length ? s : undefined;
-}
+async function updateActualizado3(conn, ids) {
+  if (!ids.length) return 0;
 
-function normalizeToArray(parsed) {
-  if (Array.isArray(parsed)) return parsed;
-  if (parsed && typeof parsed === "object") return [parsed];
-  return [];
-}
-
-// Recomendado para SQL Server: ISO UTC
-function unixSecondsToIsoUtc(ts) {
-  const n = Number(ts);
-  if (!Number.isFinite(n)) return undefined;
-  const ms = n > 1e12 ? n : n * 1000; // detecta ms vs s
-  return new Date(ms).toISOString();
-}
-
-/**
- * Mapa JSON key -> nombre de campo (lo que mandarás al Event Hub)
- */
-const KEY_TO_COL = {
-  ident: "deviceID",
-  "protocol.version": "protocolVersion",
-  timestamp: "dateTime",
-  "position.latitude": "latitude",
-  "position.longitude": "longitude",
-  "engine.ignition.status": "ignition_status",
-  "position.speed": "speed",
-  "vehicle.mileage": "mileage",
-  "gsm.mcc": "mcc",
-  "gsm.cellid": "cellID",
-  "gsm.lac": "lacID",
-  "position.altitude": "altitude",
-};
-
-/**
- * Convertidores por key
- */
-const CONVERTERS = {
-  "engine.ignition.status": b2i,
-  ident: str,
-  "protocol.version": str,
-  "position.altitude": num,
-  "position.latitude": num,
-  "position.longitude": num,
-  "position.speed": num,
-  timestamp: unixSecondsToIsoUtc,
-  "vehicle.mileage": num,
-  "gsm.mcc": num,
-  "gsm.cellid": num,
-  "gsm.lac": num,
-};
-
-// Construye row SOLO con campos presentes en el JSON
-function buildRowFromPayload(p) {
-  const row = {};
-
-  for (const [jsonKey, col] of Object.entries(KEY_TO_COL)) {
-    if (!(jsonKey in p)) continue;
-
-    const conv = CONVERTERS[jsonKey];
-    const value = conv ? conv(p[jsonKey]) : p[jsonKey];
-
-    if (value === undefined) continue;
-    row[col] = value;
+  let updated = 0;
+  for (let i = 0; i < ids.length; i += UPDATE_CHUNK) {
+    const chunk = ids.slice(i, i + UPDATE_CHUNK);
+    const placeholders = chunk.map(() => "?").join(",");
+    const sql = `
+      UPDATE PlacasGps.mainData
+      SET actualizado3 = 1
+      WHERE maindataID IN (${placeholders})
+    `;
+    const [res] = await conn.execute(sql, chunk);
+    updated += res.affectedRows || 0;
   }
-
-  // Defaults / campos fijos
-  row.OperadorGps = "QL-GV300";
-  row.imei = row.deviceID;
-  row.bat = 100;
-  row.battery = 100;
-  row.lock_status = 1;
-  row.insertDateTime = new Date().toISOString();
-  row.mileage = row.mileage ?? 0;
-
-  return row;
+  return updated;
 }
 
-// ID estable para dedupe (opcional)
-function makeEventId(row) {
-  const device = row.deviceID || "noDevice";
-  const dt = row.dateTime || "";
-  return `${device}_${dt}`;
-}
-
-// ===== Main =====
 async function main() {
-  // Healthcheck HTTP (Render/Heroku/Azure App Service)
+  // Healthcheck
   http
     .createServer((_req, res) => {
       res.writeHead(200, { "Content-Type": "text/plain" });
       res.end("OK");
     })
-    .listen(process.env.PORT || 3000, () => {
-      console.log(`✅ HTTP OK en puerto ${process.env.PORT || 3000}`);
+    .listen(Number(PORT), () => {
+      console.log(`✅ HTTP OK en puerto ${PORT}`);
     });
 
-  // Producer de Event Hubs
+  const pool = mysql.createPool({
+    host: MYSQL_HOST,
+    port: Number(MYSQL_PORT),
+    user: MYSQL_USER,
+    password: MYSQL_PASSWORD,
+    database: MYSQL_DATABASE,
+    waitForConnections: true,
+    connectionLimit: 10,
+  });
+
   const producer = new EventHubProducerClient(
     EVENTHUB_CONNECTION_STRING,
     EVENTHUB_NAME
   );
 
-  const client = mqtt.connect(MQTT_URL, {
-    username: FLESPI_TOKEN,
-    password: "",
-    keepalive: 60,
-    reconnectPeriod: 2000,
-    clean: true,
-  });
+  let running = false;
 
-  client.on("connect", () => {
-    console.log("✅ Conectado a flespi MQTT");
-    client.subscribe(TOPIC, { qos: 0 }, (err) => {
-      if (err) console.error("❌ Error subscribe:", err);
-      else console.log("📡 Suscrito a:", TOPIC);
-    });
-  });
+  async function tick() {
+    if (running) {
+      console.log("⏭️ Tick omitido: todavía hay un envío en curso.");
+      return;
+    }
+    running = true;
 
-  client.on("message", async (_topic, payloadBuf) => {
-    const rawStr = payloadBuf.toString("utf8");
+    const started = Date.now();
+    let conn;
 
-    // ✅ Log de llegada
-    console.log(
-      `📩 MQTT recibido | topic=${_topic} | bytes=${payloadBuf.length} | ${new Date().toISOString()}`
-    );
-
-    let parsed;
     try {
-      parsed = JSON.parse(rawStr);
-    } catch {
-      console.error("❌ Payload no es JSON:", rawStr.slice(0, 200));
-      return;
-    }
+      conn = await pool.getConnection();
 
-    const items = normalizeToArray(parsed);
-    if (!items.length) {
-      console.log("⚠️ MQTT: JSON válido pero vacío (sin items)");
-      return;
-    }
+      const [rows] = await conn.execute(SELECT_SQL, [BATCH_DB_LIMIT]);
 
-    console.log(`📦 Items en mensaje: ${items.length}`);
+      if (!rows.length) {
+        console.log(`⏳ Sin pendientes | ${new Date().toISOString()}`);
+        return;
+      }
 
-    // Batch para performance
-    let batch = await producer.createBatch();
-    let added = 0;
-    let skipped = 0;
-    let sent = 0;
-    let loggedSample = false;
+      console.log(`📥 Pendientes leídos=${rows.length} | ${new Date().toISOString()}`);
 
-    for (const p of items) {
-      try {
-        const row = buildRowFromPayload(p);
+      // Envío a EventHub (batch por tamaño)
+      let batch = await producer.createBatch();
+      let sent = 0;
+      let skipped = 0;
 
-        if (!row.deviceID) {
-          skipped++;
-          continue;
-        }
+      const idsToMark = [];
 
-        const eventId = makeEventId(row);
+      let loggedSample = false;
 
-        const eventBody = {
-          ...row,
-          eventId,
-          _topic,
-          _receivedAtUtc: new Date().toISOString(),
-        };
+      for (const r of rows) {
+        const body = transformRow(r);
 
-        // 🧾 Log de ejemplo (solo 1 por mensaje)
         if (!loggedSample) {
-          console.log("🧾 Ejemplo evento:", eventBody);
+          console.log("🧾 Ejemplo evento:", body);
           loggedSample = true;
         }
 
-        const ok = batch.tryAdd({ body: eventBody });
+        const ok = batch.tryAdd({ body });
         if (!ok) {
+          // manda el batch actual
           await producer.sendBatch(batch);
           sent += batch.count;
 
           batch = await producer.createBatch();
-          const ok2 = batch.tryAdd({ body: eventBody });
+          const ok2 = batch.tryAdd({ body });
           if (!ok2) {
-            console.error("❌ Evento demasiado grande para Event Hubs");
+            console.error("❌ Evento demasiado grande, se omite. maindataID=", r.maindataID);
             skipped++;
             continue;
           }
         }
 
-        added++;
-      } catch (e) {
-        console.error("❌ Error procesando payload:", e);
-        skipped++;
+        idsToMark.push(r.maindataID);
       }
+
+      if (batch.count > 0) {
+        await producer.sendBatch(batch);
+        sent += batch.count;
+      }
+
+      // ✅ Solo si el envío fue OK, marcamos actualizado3=1
+      const updated = await updateActualizado3(conn, idsToMark);
+
+      console.log(
+        `✅ OK | enviados=${sent} | omitidos=${skipped} | actualizados=${updated} | ms=${Date.now() - started}`
+      );
+    } catch (e) {
+      console.error("❌ Error tick:", e);
+      // Importante: si falló envío o update, NO marcamos actualizado3
+    } finally {
+      if (conn) conn.release();
+      running = false;
     }
+  }
 
-    if (batch.count > 0) {
-      await producer.sendBatch(batch);
-      sent += batch.count;
-    }
-
-    // ✅ Log final
-    console.log(
-      `✅ Publicado a Event Hub | added=${added} | sent=${sent} | skipped=${skipped} | ${new Date().toISOString()}`
-    );
-  });
-
-  client.on("error", (err) => console.error("MQTT error:", err));
-  client.on("close", () => console.log("🔌 MQTT desconectado"));
+  // correr al iniciar y luego cada 1 min
+  await tick();
+  const interval = setInterval(() => tick().catch(console.error), INTERVAL_MS);
 
   process.on("SIGINT", async () => {
     console.log("\n🛑 Cerrando...");
+    clearInterval(interval);
     try {
-      client.end(true);
       await producer.close();
+      await pool.end();
     } catch {}
     process.exit(0);
   });
